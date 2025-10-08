@@ -1,0 +1,60 @@
+# .NET Core / ASP.NET Core .gitignore
+# Build results
+[Dd]ebug/
+[Rr]elease/
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Visual Studio Code
+.vscode/
+
+# Rider
+.idea/
+*.sln.iml
+
+# ASP.NET Scaffolding
+ScaffoldingReadMe.txt
+
+# DotCover
+*.dotCover
+
+# NuGet Packages
+*.nupkg
+# The packages folder can be ignored if it is not under source control
+**/packages/*
+# except build/, which is used as an MSBuild target.
+!**/packages/build/
+# Uncomment if necessary: NuGet restore creates this folder, but files may be needed for MSBuild
+#!**/packages/repositories.config
+
+# Windows image file caches
+Thumbs.db
+ehthumbs.db
+
+# VS Code settings
+.history/
+
+# Others
+*.log
+*.DS_Store
+
+# Resharper
+*.DotSettings.user
+
+# Entity Framework
+Migrations/
+
+# Static web assets
+*.staticwebassets.*
+
+# Publish output
+publish/
+
+# Azure Functions local settings
+local.settings.json
