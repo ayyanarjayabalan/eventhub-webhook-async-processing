@@ -1,0 +1,51 @@
+{
+  "UserConfig": {
+    "NamespaceConfig": [
+      {
+        "Type": "EventHub",
+        "Name": "emulatorNs1",
+        "Entities": [
+          {
+            "Name": "EventHub",
+            "PartitionCount": "4",
+            "ConsumerGroups": [
+              {
+                "Name": "EventProcessor"
+              }
+            ]
+          },
+          {
+            "Name": "FieldChangeEventHub",
+            "PartitionCount": "4",
+            "ConsumerGroups": [
+              {
+                "Name": "FieldChangeEventProcessor"
+              }
+            ]
+          },
+          {
+            "Name": "MilestoneEventHub",
+            "PartitionCount": "4",
+            "ConsumerGroups": [
+              {
+                "Name": "MilestoneEventProcessor"
+              }
+            ]
+          },
+          {
+            "Name": "ConditionEventHub",
+            "PartitionCount": "4",
+            "ConsumerGroups": [
+              {
+                "Name": "ConditionEventProcessor"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "LoggingConfig": {
+      "Type": "File"
+    }
+  }
+}
