@@ -1,0 +1,6 @@
+@TestApp.EventHubApp.WebAPI_HostAddress = http://localhost:5026
+
+GET {{TestApp.EventHubApp.WebAPI_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
