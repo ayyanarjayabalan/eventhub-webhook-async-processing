@@ -13,12 +13,34 @@
         public string FieldChangeEventHubName { get; set; } = "FieldChangeEventHub";
         public string MilestoneEventHubName { get; set; } = "MilestoneEventHub";
         public string ConditionEventHubName { get; set; } = "ConditionEventHub";
+        public string DeadLetterEventHubName { get; set; } = "deadletter-events"; // new dead letter hub
 
         // Names of the consumer groups (must match Config.json)
         public string EventsConsumerGroup { get; set; } = "EventProcessor";
         public string FieldChangeConsumerGroup { get; set; } = "FieldChangeEventProcessor";
         public string MilestoneConsumerGroup { get; set; } = "MilestoneEventProcessor";
         public string ConditionConsumerGroup { get; set; } = "ConditionEventProcessor";
+        public string DeadLetterConsumerGroup { get; set; } = "deadlettereventprocessor"; // new consumer group
+    }    public class ProcessingControlSettings
+    {
+        public bool IsProcessingPaused { get; set; }
+    }
+
+    public class DeadLetterMonitoringSettings
+    {
+        public int ThresholdCount { get; set; } = 50;
+        public int CheckIntervalHours { get; set; } = 1;
+        public string AlertEmail { get; set; } = string.Empty;
+    }
+
+    public class EmailSettings
+    {
+        public string SmtpServer { get; set; } = string.Empty;
+        public int SmtpPort { get; set; } = 587;
+        public string Username { get; set; } = string.Empty;
+        public string Password { get; set; } = string.Empty;
+        public string FromEmail { get; set; } = string.Empty;
+        public bool EnableSsl { get; set; } = true;
     }
 
     /// <summary>

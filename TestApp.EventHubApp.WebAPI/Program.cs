@@ -3,13 +3,16 @@ using Azure.Messaging.EventHubs.Producer;
 using Azure.Storage.Blobs;
 using Microsoft.Extensions.Options;
 using TestApp.EventHubApp.WebAPI.Helpers;
+using Microsoft.Extensions.Caching.Memory;
 
 var builder = WebApplication.CreateBuilder(args);
-
 
 // 1. Configuration Setup
 builder.Services.Configure<EventHubSettings>(builder.Configuration.GetSection("EventHubs"));
 builder.Services.Configure<AzureStorageSettings>(builder.Configuration.GetSection("AzureStorage"));
+builder.Services.Configure<ProcessingControlSettings>(builder.Configuration.GetSection("ProcessingControl"));
+builder.Services.Configure<DeadLetterMonitoringSettings>(builder.Configuration.GetSection("DeadLetterMonitoring"));
+builder.Services.Configure<EmailSettings>(builder.Configuration.GetSection("EmailSettings"));
 
 // 2. Client Registrations
 builder.Services.AddSingleton<EventHubProducerClient>(sp =>
@@ -22,6 +25,17 @@ builder.Services.AddSingleton<EventHubProducerClient>(sp =>
 // Mock External Services
 builder.Services.AddSingleton<IDataStore, MockMongoDataStore>();
 builder.Services.AddSingleton<EncompassApiClient>();
+
+// Email and DLQ Services
+builder.Services.AddSingleton<IEmailService, MockEmailService>();
+builder.Services.AddSingleton<IDeadLetterQueueService, MockDeadLetterQueueService>();
+builder.Services.AddSingleton<IProcessingPauseProvider, MemoryCachePauseProvider>();
+builder.Services.AddSingleton<IDeadLetterProducer>(sp =>
+{
+    var settings = sp.GetRequiredService<IOptions<EventHubSettings>>();
+    var logger = sp.GetRequiredService<ILogger<DeadLetterProducer>>();
+    return new DeadLetterProducer(settings, logger);
+});
 builder.Services.AddSingleton<BlobServiceClient>(sp =>
 {
     var settings = sp.GetRequiredService<IOptions<AzureStorageSettings>>().Value;
@@ -44,12 +58,14 @@ builder.Services.AddSingleton<BlobServiceClient>(sp =>
     return new BlobServiceClient(settings.AzuriteConnectionString, blobClientOptions);
 });
 
+builder.Services.AddMemoryCache();
 
 // 3. Worker Services (IHostedService)
 builder.Services.AddHostedService<EventsWorker>();
 builder.Services.AddHostedService<FieldChangeWorker>();
 builder.Services.AddHostedService<MilestoneWorker>();
 builder.Services.AddHostedService<ConditionWorker>();
+builder.Services.AddHostedService<DeadLetterMonitorJob>();
 
 builder.Services.AddControllers();
 builder.Services.AddLogging(configure => configure.AddConsole());

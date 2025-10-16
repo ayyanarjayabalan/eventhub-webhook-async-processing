@@ -1,0 +1,22 @@
+  // -----------------------------------------------------------
+    // --- CONFIGURATION FOR EVENT HUBS EMULATOR AND AZURITE ---
+    // -----------------------------------------------------------
+    // Local Setup
+    //"EventHubs": {
+    //    // Connects to the eventhubs-emulator Docker container on port 5672
+    //    "EmulatorConnectionString": "Endpoint=sb://localhost;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;",
+    //    "EventsHubName": "EventHub",
+    //    "FieldChangeEventHubName": "FieldChangeEventHub",
+    //    "MilestoneEventHubName": "MilestoneEventHub",
+    //    "ConditionEventHubName": "ConditionEventHub",
+    //    "EventsConsumerGroup": "EventProcessor",
+    //    "FieldChangeConsumerGroup": "FieldChangeEventProcessor",
+    //    "MilestoneConsumerGroup": "MilestoneEventProcessor",
+    //    "ConditionConsumerGroup": "ConditionEventProcessor"
+    //},
+    //"AzureStorage": {
+    //    // Connects to the azurite Docker container on port 10000
+    //    //"AzuriteConnectionString": "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xMXuK7EBLg+0d/gd2jY9w42fN0A1c+rS/M5zLhY6vWp4P5d0B6o/Q==;BlobEndpoint=http://localhost:10000/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;TableEndpoint=http://localhost:10002/devstoreaccount1;",
+    //    "AzuriteConnectionString": "UseDevelopmentStorage=true",
+    //    "CheckpointContainerName": "eventhub-checkpoints"
+    //}

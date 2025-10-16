@@ -11,6 +11,7 @@ using Azure.Storage.Blobs;
 using Microsoft.AspNetCore.Components.Web;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Diagnostics;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,86 @@ using EventData = Azure.Messaging.EventHubs.EventData;
 
 namespace TestApp.EventHubApp.WebAPI.Helpers
 {
+    // helper for transient error detection
+    internal static class ErrorClassifier
+    {
+        public static bool IsTransient(Exception ex)
+        {
+            // simple heuristic; expand as needed
+            if (ex is TaskCanceledException || ex is TimeoutException) return true;
+            if (ex.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+    }
+
+    public interface IDeadLetterProducer
+    {
+        Task SendToDeadLetterAsync(RawEventModel rawEvent, string sourceHub, string partitionId, long? sequenceNumber, string offset, string reason);
+    }    public class DeadLetterProducer : IDeadLetterProducer
+    {
+        private readonly EventHubProducerClient _producer;
+        private readonly ILogger<DeadLetterProducer> _logger;
+        
+        public DeadLetterProducer(IOptions<EventHubSettings> settings, ILogger<DeadLetterProducer> logger)
+        {
+            var eventHubSettings = settings.Value;
+            _producer = new EventHubProducerClient(eventHubSettings.EmulatorConnectionString, eventHubSettings.DeadLetterEventHubName);
+            _logger = logger;
+        }
+        
+        public DeadLetterProducer(EventHubProducerClient producer, ILogger<DeadLetterProducer> logger)
+        {
+            _producer = producer; 
+            _logger = logger;
+        }
+        public async Task SendToDeadLetterAsync(RawEventModel rawEvent, string sourceHub, string partitionId, long? sequenceNumber, string offset, string reason)
+        {
+            var payload = new {
+                rawEvent.LoanId,
+                rawEvent.EventType,
+                rawEvent.FieldId,
+                rawEvent.MilestoneName,
+                rawEvent.ConditionId,
+                SourceHub = sourceHub,
+                PartitionId = partitionId,
+                SequenceNumber = sequenceNumber,
+                Offset = offset,
+                FailureReason = reason,
+                TimestampUtc = DateTime.UtcNow
+            };
+            var json = JsonSerializer.Serialize(payload);
+            using var batch = await _producer.CreateBatchAsync();
+            batch.TryAdd(new EventData(Encoding.UTF8.GetBytes(json)));
+            await _producer.SendAsync(batch);
+            _logger?.LogWarning("Dead-lettered event from {SourceHub} reason={Reason}", sourceHub, reason);
+        }
+    }
+
+    public interface IProcessingPauseProvider
+    {
+        bool IsPaused();
+    }
+
+    public class MemoryCachePauseProvider : IProcessingPauseProvider
+    {
+        private readonly IMemoryCache _cache;
+        private const string PauseKey = "ProcessingPaused";
+        private readonly IOptions<ProcessingControlSettings> _options;
+        public MemoryCachePauseProvider(IMemoryCache cache, IOptions<ProcessingControlSettings> options)
+        { _cache = cache; _options = options; }
+        public bool IsPaused()
+        {
+            if (_cache.TryGetValue(PauseKey, out bool paused)) return paused;
+            // seed from config
+            paused = _options.Value.IsProcessingPaused;
+            _cache.Set(PauseKey, paused, TimeSpan.FromHours(1));
+            return paused;
+        }
+        public static void SetPaused(IMemoryCache cache, bool paused)
+        {
+            cache.Set(PauseKey, paused, TimeSpan.FromHours(1));
+        }
+    }
 
     // --- Event Processing Base Class ---
     public abstract class EventProcessorBase<TWorker> : BackgroundService
@@ -31,6 +112,9 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
         protected readonly string _hubName;
         protected readonly string _consumerGroup;
         protected EventProcessorClient _processorClient;
+        protected readonly IProcessingPauseProvider _pauseProvider;
+        protected readonly IDeadLetterProducer _deadLetterProducer;
+        protected readonly IDataStore _dataStoreOptional; // for idempotency checks
 
         public EventProcessorBase(
             IOptions<EventHubSettings> settings,
@@ -38,7 +122,10 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             BlobServiceClient blobServiceClient,
             ILogger<TWorker> logger,
             string hubName,
-            string consumerGroup)
+            string consumerGroup,
+            IProcessingPauseProvider pauseProvider = null,
+            IDeadLetterProducer deadLetterProducer = null,
+            IDataStore dataStoreOptional = null)
         {
             _logger = logger;
             _settings = settings.Value;
@@ -46,6 +133,9 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             _blobServiceClient = blobServiceClient;
             _hubName = hubName;
             _consumerGroup = consumerGroup;
+            _pauseProvider = pauseProvider;
+            _deadLetterProducer = deadLetterProducer;
+            _dataStoreOptional = dataStoreOptional;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -91,7 +181,7 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             }
         }
 
-        protected abstract Task HandleEvent(ProcessEventArgs eventArgs);
+        protected abstract Task HandleEventInternal(ProcessEventArgs eventArgs);
 
         protected Task HandleError(ProcessErrorEventArgs eventArgs)
         {
@@ -99,6 +189,59 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
                 "Error in Event Processor for hub '{HubName}' (Partition: {PartitionId}, Action: {Action})",
                 _hubName, eventArgs.PartitionId, eventArgs.Operation);
             return Task.CompletedTask;
+        }
+
+        private async Task HandleEvent(ProcessEventArgs eventArgs)
+        {
+            // pause logic
+            if (_pauseProvider?.IsPaused() == true)
+            {
+                _logger.LogInformation("{Worker} paused; skipping event (no checkpoint).", typeof(TWorker).Name);
+                return; // do not checkpoint so it can be reprocessed later
+            }
+
+            int attempt = 0;
+            const int maxAttempts = 3;
+            var rawJson = Encoding.UTF8.GetString(eventArgs.Data.Body.ToArray());
+            RawEventModel rawEvent = null;
+            try { rawEvent = JsonSerializer.Deserialize<RawEventModel>(rawJson); }
+            catch (Exception ex)
+            {
+                // non-transient invalid JSON -> DLQ immediately
+                await _deadLetterProducer?.SendToDeadLetterAsync(new RawEventModel("N/A","invalid","","",""), _hubName, eventArgs.Partition.PartitionId, eventArgs.Data.SequenceNumber, eventArgs.Data.Offset.ToString(), "Invalid JSON: " + ex.Message);
+                return;
+            }
+            while (true)
+            {
+                try
+                {
+                    // idempotency stub (could query Mongo/Blob)
+                    // if (await AlreadyProcessedAsync(rawEvent)) { await eventArgs.UpdateCheckpointAsync(eventArgs.CancellationToken); return; }
+                    await HandleEventInternal(eventArgs);
+                    await eventArgs.UpdateCheckpointAsync(eventArgs.CancellationToken);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    attempt++;
+                    bool transient = ErrorClassifier.IsTransient(ex);
+                    if (!transient)
+                    {
+                        await _deadLetterProducer?.SendToDeadLetterAsync(rawEvent, _hubName, eventArgs.Partition.PartitionId, eventArgs.Data.SequenceNumber, eventArgs.Data.Offset.ToString(), ex.Message);
+                        _logger.LogError(ex, "Non-transient error in {Worker}; dead-lettered.", typeof(TWorker).Name);
+                        return;
+                    }
+                    if (attempt >= maxAttempts)
+                    {
+                        await _deadLetterProducer?.SendToDeadLetterAsync(rawEvent, _hubName, eventArgs.Partition.PartitionId, eventArgs.Data.SequenceNumber, eventArgs.Data.Offset.ToString(), $"Retry limit exceeded after {attempt} attempts: {ex.Message}");
+                        _logger.LogError(ex, "Transient error retry limit reached in {Worker}; dead-lettered.", typeof(TWorker).Name);
+                        return;
+                    }
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt));
+                    _logger.LogWarning(ex, "Transient error in {Worker}; attempt {Attempt}/{Max}. Backing off {Delay}s", typeof(TWorker).Name, attempt, maxAttempts, delay.TotalSeconds);
+                    await Task.Delay(delay, eventArgs.CancellationToken);
+                }
+            }
         }
     }
 
@@ -119,8 +262,10 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             IOptions<AzureStorageSettings> storageSettings,
             BlobServiceClient blobServiceClient,
             IDataStore dataStore,
-            ILogger<EventsWorker> logger)
-            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.EventsHubName, settings.Value.EventsConsumerGroup)
+            ILogger<EventsWorker> logger,
+            IProcessingPauseProvider pauseProvider,
+            IDeadLetterProducer deadLetterProducer)
+            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.EventsHubName, settings.Value.EventsConsumerGroup, pauseProvider, deadLetterProducer, dataStore)
         {
             _dataStore = dataStore;
 
@@ -130,7 +275,7 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             _conditionProducer = new EventHubProducerClient(_settings.EmulatorConnectionString, _settings.ConditionEventHubName);
         }
 
-        protected override async Task HandleEvent(ProcessEventArgs eventArgs)
+        protected override async Task HandleEventInternal(ProcessEventArgs eventArgs)
         {
             try
             {
@@ -162,6 +307,7 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
                         break;
                     default:
                         _logger.LogWarning("EventsWorker: Unknown event type '{EventType}'. Skipping forwarding.", rawEvent.EventType);
+                        throw new TimeoutException("Simulated timeout exception for testing");
                         break;
                 }
 
@@ -179,6 +325,7 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "EventsWorker: Error processing or routing event.");
+                throw ex;
             }
         }
     }
@@ -196,13 +343,15 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             IOptions<AzureStorageSettings> storageSettings,
             BlobServiceClient blobServiceClient,
             EncompassApiClient encompassClient,
-            ILogger<FieldChangeWorker> logger)
-            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.FieldChangeEventHubName, settings.Value.FieldChangeConsumerGroup)
+            ILogger<FieldChangeWorker> logger,
+            IProcessingPauseProvider pauseProvider,
+            IDeadLetterProducer deadLetterProducer)
+            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.FieldChangeEventHubName, settings.Value.FieldChangeConsumerGroup, pauseProvider, deadLetterProducer)
         {
             _encompassClient = encompassClient;
         }
 
-        protected override async Task HandleEvent(ProcessEventArgs eventArgs)
+        protected override async Task HandleEventInternal(ProcessEventArgs eventArgs)
         {
             try
             {
@@ -245,13 +394,15 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             IOptions<AzureStorageSettings> storageSettings,
             BlobServiceClient blobServiceClient,
             EncompassApiClient encompassClient,
-            ILogger<MilestoneWorker> logger)
-            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.MilestoneEventHubName, settings.Value.MilestoneConsumerGroup)
+            ILogger<MilestoneWorker> logger,
+            IProcessingPauseProvider pauseProvider,
+            IDeadLetterProducer deadLetterProducer)
+            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.MilestoneEventHubName, settings.Value.MilestoneConsumerGroup, pauseProvider, deadLetterProducer)
         {
             _encompassClient = encompassClient;
         }
 
-        protected override async Task HandleEvent(ProcessEventArgs eventArgs)
+        protected override async Task HandleEventInternal(ProcessEventArgs eventArgs)
         {
             try
             {
@@ -290,13 +441,15 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             IOptions<AzureStorageSettings> storageSettings,
             BlobServiceClient blobServiceClient,
             EncompassApiClient encompassClient,
-            ILogger<ConditionWorker> logger)
-            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.ConditionEventHubName, settings.Value.ConditionConsumerGroup)
+            ILogger<ConditionWorker> logger,
+            IProcessingPauseProvider pauseProvider,
+            IDeadLetterProducer deadLetterProducer)
+            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.ConditionEventHubName, settings.Value.ConditionConsumerGroup, pauseProvider, deadLetterProducer)
         {
             _encompassClient = encompassClient;
         }
 
-        protected override async Task HandleEvent(ProcessEventArgs eventArgs)
+        protected override async Task HandleEventInternal(ProcessEventArgs eventArgs)
         {
             try
             {
@@ -319,6 +472,106 @@ namespace TestApp.EventHubApp.WebAPI.Helpers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "ConditionWorker: Error processing event.");
+            }
+        }
+    }
+
+    public class DeadLetterReprocessorWorker : EventProcessorBase<DeadLetterReprocessorWorker>
+    {
+        public DeadLetterReprocessorWorker(
+            IOptions<EventHubSettings> settings,
+            IOptions<AzureStorageSettings> storageSettings,
+            BlobServiceClient blobServiceClient,
+            ILogger<DeadLetterReprocessorWorker> logger,
+            IProcessingPauseProvider pauseProvider,
+            IDeadLetterProducer dlqProducer)
+            : base(settings, storageSettings, blobServiceClient, logger, settings.Value.DeadLetterEventHubName, settings.Value.DeadLetterConsumerGroup, pauseProvider, dlqProducer)
+        { }
+        protected override Task HandleEventInternal(ProcessEventArgs eventArgs)
+        { /* read dead letter payload and re-publish to original hub based on EventType */ return Task.CompletedTask; }
+    }    public class DeadLetterMonitorJob : BackgroundService
+    {
+        private readonly ILogger<DeadLetterMonitorJob> _logger;
+        private readonly IDeadLetterQueueService _dlqService;
+        private readonly IEmailService _emailService;
+        private readonly DeadLetterMonitoringSettings _monitoringSettings;
+        private DateTime _lastEmailSent = DateTime.MinValue;
+        private const int EmailCooldownHours = 24; // Don't spam emails
+
+        public DeadLetterMonitorJob(
+            ILogger<DeadLetterMonitorJob> logger,
+            IDeadLetterQueueService dlqService,
+            IEmailService emailService,
+            IOptions<DeadLetterMonitoringSettings> monitoringSettings)
+        {
+            _logger = logger;
+            _dlqService = dlqService;
+            _emailService = emailService;
+            _monitoringSettings = monitoringSettings.Value;
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("Dead Letter Monitor Job started. Checking every {Hours} hours for threshold {Threshold}", 
+                _monitoringSettings.CheckIntervalHours, _monitoringSettings.ThresholdCount);
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var dlqCount = await _dlqService.GetApproximateMessageCountAsync();
+                    _logger.LogDebug("Dead letter queue count: {Count}", dlqCount);
+
+                    if (dlqCount > _monitoringSettings.ThresholdCount)
+                    {
+                        _logger.LogWarning("DLQ count {Count} exceeds threshold {Threshold}", dlqCount, _monitoringSettings.ThresholdCount);
+
+                        // Check if we should send an email (cooldown period)
+                        var timeSinceLastEmail = DateTime.UtcNow - _lastEmailSent;
+                        if (timeSinceLastEmail.TotalHours >= EmailCooldownHours)
+                        {
+                            await SendAlertEmailAsync(dlqCount);
+                            _lastEmailSent = DateTime.UtcNow;
+                        }
+                        else
+                        {
+                            _logger.LogInformation("Email cooldown active. Last email sent {Hours:F1} hours ago", 
+                                timeSinceLastEmail.TotalHours);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error in DeadLetterMonitorJob");
+                }
+
+                await Task.Delay(TimeSpan.FromHours(_monitoringSettings.CheckIntervalHours), stoppingToken);
+            }
+        }
+
+        private async Task SendAlertEmailAsync(int dlqCount)
+        {
+            try
+            {
+                var subject = $"ALERT: Dead Letter Queue Threshold Exceeded - {dlqCount} messages";
+                var body = $@"
+Dead Letter Queue Alert
+
+Current Count: {dlqCount}
+Threshold: {_monitoringSettings.ThresholdCount}
+Timestamp: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC
+
+The dead letter queue has exceeded the configured threshold. Please review and reprocess failed events.
+
+This alert will not be sent again for 24 hours unless the system is restarted.
+";
+
+                await _emailService.SendAlertEmailAsync(subject, body, _monitoringSettings.AlertEmail);
+                _logger.LogInformation("Alert email sent for DLQ count: {Count}", dlqCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to send DLQ alert email");
             }
         }
     }

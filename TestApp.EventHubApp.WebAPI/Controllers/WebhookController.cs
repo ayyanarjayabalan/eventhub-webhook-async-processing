@@ -4,6 +4,7 @@ using Azure.Messaging.EventHubs.Producer;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Diagnostics;
 using TestApp.EventHubApp.WebAPI.Helpers;
+using Microsoft.Extensions.Caching.Memory;
 
 using EventData = Azure.Messaging.EventHubs.EventData;
 
@@ -17,11 +18,13 @@ namespace TestApp.EventHubApp.WebAPI.Controllers
     {
         private readonly EventHubProducerClient _producerClient;
         private readonly ILogger<WebhookController> _logger;
+        private readonly IMemoryCache _cache;
 
-        public WebhookController(EventHubProducerClient producerClient, ILogger<WebhookController> logger)
+        public WebhookController(EventHubProducerClient producerClient, ILogger<WebhookController> logger, IMemoryCache cache)
         {
             _producerClient = producerClient;
             _logger = logger;
+            _cache = cache;
         }
 
         [HttpPost("event")]
@@ -45,6 +48,20 @@ namespace TestApp.EventHubApp.WebAPI.Controllers
                 _logger.LogError(ex, "Failed to send event to Event Hub.");
                 return StatusCode(500, new { status = "Internal Server Error" });
             }
+        }
+
+        [HttpPost("pause")]
+        public IActionResult Pause()
+        {
+            MemoryCachePauseProvider.SetPaused(_cache, true);
+            return Ok(new { status = "paused" });
+        }
+
+        [HttpPost("resume")]
+        public IActionResult Resume()
+        {
+            MemoryCachePauseProvider.SetPaused(_cache, false);
+            return Ok(new { status = "resumed" });
         }
     }
 }
